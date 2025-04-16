@@ -7,49 +7,74 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, TensorDataset
 import pandas_ta as ta
+import pandas as pd
 from StockPredictionModel import StockPredictionModel
 
 
 # Step 1: Data Collection
 def fetch_stock_data(ticker, start_date, end_date):
-    data = yf.download(ticker, start=start_date, end=end_date)
+    data = yf.download(ticker, start=start_date, end=end_date, group_by="ticker")
+
     if data.empty:
         raise ValueError(f"No data fetched for ticker {ticker}. Check the ticker symbol or date range.")
+
+    # 🛠 Flatten columns if they are MultiIndex (like ('Close', 'AAPL'))
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = [f"{col[0]}" if col[1] == '' else f"{col[0]}_{col[1]}" for col in data.columns]
+
+    # ✅ If still no 'Close', try fallback fix
+    if 'Close' not in data.columns:
+        close_candidates = [col for col in data.columns if 'Close' in col]
+        if close_candidates:
+            data.rename(columns={close_candidates[0]: 'Close'}, inplace=True)
+
     return data
+
+
 
 
 # Add indicators to the dataset
 def add_indicators(df):
     print("Adding technical indicators...")
-    if df.empty:
-        raise ValueError("Error: Dataframe is empty. Cannot calculate indicators.")
 
-    # Ensure 'Close' column exists
-    if 'Close' not in df.columns:
-        raise ValueError("Error: 'Close' column is missing in the dataset. Cannot calculate indicators.")
+    df['Return'] = df['Close'].pct_change()
 
-    # Add technical indicators
-    df['Return'] = df['Close'].pct_change()  # Daily return
-    print("\nReturn - \n", df.head(50)['Return'])
-    sma10 = ta.sma(df["Close"], length=10)
-    print("\nSMA10 - \n", sma10)
-    # df['RSI'] = ta.rsi(df['Close'], length=14)  # Relative Strength Index (14-day)
-    # df['EMA20'] = ta.ema(df['Close'], length=20)  # Exponential Moving Average (20-day)
+    # Check for MultiIndex again, just in case
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
 
-    # Drop rows with NaN values caused by indicator calculation
+    ###
+    # Need to rename the indicators as such (the columns after fetch):
+    # "Columns after fetch: ['AAPL_Open', 'AAPL_High', 'AAPL_Low', 'Close', 'AAPL_Volume']
+    ###
+    for col in ['AAPL_Open', 'AAPL_High', 'AAPL_Low', 'Close', 'AAPL_Volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        else:
+            raise KeyError(f"Missing expected column: {col}")
+
+    # Add indicators
+    df.ta.sma(length=20, append=True)
+    df.ta.ema(length=20, append=True)
+    df.ta.rsi(length=14, append=True)
+    df.ta.macd(append=True)
+    df.ta.bbands(length=20, std=2, append=True)
+
     df = df.dropna()
-    print("Indicators added successfully. Dataset preview:")
-    print(df.head(50))
+    print("Indicators added successfully. Columns:")
+    print(df.columns.tolist())
     return df
+
+
 
 
 # Step 2: Feature Engineering
 def prepare_features(data):
-    # Select features including indicators
-    features = data[['Open', 'High', 'Low', 'Volume', 'Return', 'SMA20']]
-    target = data['Close']  # Predict the 'Close' price
-
+    features = data[['AAPL_Open', 'AAPL_High', 'AAPL_Low', 'AAPL_Volume', 'Return',
+                     'SMA_20', 'EMA_20', 'RSI_14', 'MACD_12_26_9', 'BBL_20_2.0']]
+    target = data['Close']
     return features, target
+
 
 
 def main():
@@ -59,8 +84,8 @@ def main():
 
     # Step 1: Fetch stock data
     data = fetch_stock_data(ticker, start_date, end_date)
+    print("Columns after fetch:", data.head(10).columns.tolist())
 
-    print(data.head(50))
     # Step 2: Add indicators
     data = add_indicators(data)
 
