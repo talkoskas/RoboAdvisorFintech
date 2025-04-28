@@ -9,28 +9,24 @@ from torch.utils.data import DataLoader, TensorDataset
 import pandas_ta as ta
 import pandas as pd
 from StockPredictionModel import StockPredictionModel
+import sqlite3
 
 
 # Step 1: Data Collection
 def fetch_stock_data(ticker, start_date, end_date):
-    data = yf.download(ticker, start=start_date, end=end_date, group_by="ticker")
+    data = yf.download(ticker, start=start_date, end=end_date)
 
     if data.empty:
-        raise ValueError(f"No data fetched for ticker {ticker}. Check the ticker symbol or date range.")
+        raise ValueError(f"No data fetched for ticker {ticker}.")
 
-    # 🛠 Flatten columns if they are MultiIndex (like ('Close', 'AAPL'))
+    # In case it has multiindex, flatten it (safety net)
     if isinstance(data.columns, pd.MultiIndex):
-        data.columns = [f"{col[0]}" if col[1] == '' else f"{col[0]}_{col[1]}" for col in data.columns]
+        data.columns = [col[0] for col in data.columns]
 
-    # ✅ If still no 'Close', try fallback fix
-    if 'Close' not in data.columns:
-        close_candidates = [col for col in data.columns if 'Close' in col]
-        if close_candidates:
-            data.rename(columns={close_candidates[0]: 'Close'}, inplace=True)
+    # Now rename if the ticker name appears in column names
+    data.columns = [col.replace(f"{ticker}_", "") for col in data.columns]
 
     return data
-
-
 
 
 # Add indicators to the dataset
@@ -39,144 +35,144 @@ def add_indicators(df):
 
     df['Return'] = df['Close'].pct_change()
 
-    # Check for MultiIndex again, just in case
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [col[0] for col in df.columns]
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    ###
-    # Need to rename the indicators as such (the columns after fetch):
-    # "Columns after fetch: ['AAPL_Open', 'AAPL_High', 'AAPL_Low', 'Close', 'AAPL_Volume']
-    ###
-    for col in ['AAPL_Open', 'AAPL_High', 'AAPL_Low', 'Close', 'AAPL_Volume']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        else:
-            raise KeyError(f"Missing expected column: {col}")
-
-    # Add indicators
+    # Add technical indicators
     df.ta.sma(length=20, append=True)
     df.ta.ema(length=20, append=True)
     df.ta.rsi(length=14, append=True)
     df.ta.macd(append=True)
-    df.ta.bbands(length=20, std=2, append=True)
+
+    # Handle Bollinger Bands separately
+    bbands = df.ta.bbands(length=20, std=2)
+
+    if bbands is not None:
+        # bbands will have BBL, BBM, BBU, BBB
+        bbands = bbands.rename(columns={
+            'BBL_20_2.0': 'BBL_20_2_0',
+            'BBM_20_2.0': 'BBM_20_2_0',
+            'BBU_20_2.0': 'BBU_20_2_0',
+            'BBB_20_2.0': 'BBB_20_2_0'
+        })
+        df = pd.concat([df, bbands], axis=1)
 
     df = df.dropna()
-    print("Indicators added successfully. Columns:")
-    print(df.columns.tolist())
+    print("Indicators added successfully.")
     return df
 
 
-
-
-# Step 2: Feature Engineering
 def prepare_features(data):
-    features = data[['AAPL_Open', 'AAPL_High', 'AAPL_Low', 'AAPL_Volume', 'Return',
-                     'SMA_20', 'EMA_20', 'RSI_14', 'MACD_12_26_9', 'BBL_20_2.0']]
+    features = data[['Open', 'High', 'Low', 'Volume', 'Return',
+                     'SMA_20', 'EMA_20', 'RSI_14', 'MACD_12_26_9', 'BBL_20_2_0']]
     target = data['Close']
     return features, target
 
 
+def save_to_db(df, ticker):
+    conn = sqlite3.connect("stocks.db")
+    df = df.copy()
+    df['ticker'] = ticker
+    df['date'] = df.index
+
+    # Only keep the necessary columns
+    expected_cols = [
+        'ticker', 'date', 'Open', 'High', 'Low', 'Close', 'Volume',
+        'Return', 'SMA_20', 'EMA_20', 'RSI_14', 'MACD_12_26_9',
+        'BBL_20_2_0', 'BBM_20_2_0', 'BBU_20_2_0', 'BBB_20_2_0'
+    ]
+
+    df = df[[col for col in expected_cols if col in df.columns]]  # Safe filtering
+
+    df.to_sql("stock_data", conn, if_exists='append', index=False)
+    conn.commit()
+    conn.close()
+    print(f"Saved {len(df)} records for {ticker} to the database.")
+
+
 
 def main():
-    ticker = "AAPL"  # Example: Apple Inc.
+    ticker = input("Enter stock ticker symbol (e.g., AAPL, MSFT, TSLA): ").upper()
     start_date = "2015-01-01"
     end_date = "2023-12-01"
 
-    # Step 1: Fetch stock data
+    # Fetch stock data
     data = fetch_stock_data(ticker, start_date, end_date)
-    print("Columns after fetch:", data.head(10).columns.tolist())
+    print("Fetched columns:", data.columns.tolist())
 
-    # Step 2: Add indicators
+    # Add indicators
     data = add_indicators(data)
 
-    # Step 3: Prepare features and target
+    # Save to database before preparing features and scaling
+    save_to_db(data, ticker)
+
+    # Prepare features and target
     X, y = prepare_features(data)
 
-    if X.shape[0] == 0:
-        raise ValueError("Input data X is empty. Check the data pipeline.")
-    print(f"Shape of X: {X.shape}")
-    print(f"Content of X:\n{X.head()}")
+    if X.empty:
+        raise ValueError("No training data available after preprocessing.")
 
-    # Step 4: Normalize features
+    # Normalize
     scaler = MinMaxScaler()
-    X_normalized = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X)
 
     # Train-test split
-    X_train, X_test, y_train, y_test = train_test_split(X_normalized, y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-    # Convert to PyTorch tensors
+    # Convert to tensors
     X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
     X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-    y_train_tensor = torch.tensor(y_train.values, dtype=torch.float32).unsqueeze(1)  # Add dimension for output
+    y_train_tensor = torch.tensor(y_train.values, dtype=torch.float32).unsqueeze(1)
     y_test_tensor = torch.tensor(y_test.values, dtype=torch.float32).unsqueeze(1)
 
-    # Use DataLoader for batch processing
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-    batch_size = 32
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    # Loaders
+    train_loader = DataLoader(TensorDataset(X_train_tensor, y_train_tensor), batch_size=32, shuffle=True)
+    test_loader = DataLoader(TensorDataset(X_test_tensor, y_test_tensor), batch_size=32)
 
-    # Step 5: Define the Neural Network
-    input_size = X_train.shape[1]
-    model = StockPredictionModel(input_size=input_size)
-    criterion = nn.HuberLoss()  # Huber loss for regression
+    # Model
+    model = StockPredictionModel(input_size=X.shape[1])
+    criterion = nn.HuberLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
 
-    # Training loop
-    num_epochs = 100
-    train_losses = []
-    test_losses = []
-
-    for epoch in range(num_epochs):
+    # Training
+    train_losses, test_losses = [], []
+    for epoch in range(100):
         model.train()
-        running_loss = 0.0
-
+        total_loss = 0.0
         for X_batch, y_batch in train_loader:
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
+            loss = criterion(model(X_batch), y_batch)
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
+            total_loss += loss.item()
+        train_losses.append(total_loss / len(train_loader))
 
-        scheduler.step()
-        train_losses.append(running_loss / len(train_loader))
-
-        # Evaluate on test data
         model.eval()
         with torch.no_grad():
-            test_loss = sum(criterion(model(X_batch), y_batch).item() for X_batch, y_batch in test_loader) / len(
-                test_loader)
+            test_loss = sum(criterion(model(X_batch), y_batch).item() for X_batch, y_batch in test_loader) / len(test_loader)
             test_losses.append(test_loss)
 
         if (epoch + 1) % 10 == 0:
-            print(
-                f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {running_loss / len(train_loader):.4f}, Test Loss: {test_loss:.4f}")
+            print(f"Epoch {epoch+1}: Train Loss={train_losses[-1]:.4f}, Test Loss={test_loss:.4f}")
 
-    # Step 6: Plot Training and Test Losses
+    # Plot
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, num_epochs + 1), train_losses, label='Train Loss')
-    plt.plot(range(1, num_epochs + 1), test_losses, label='Test Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Train vs Test Loss')
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(test_losses, label="Test Loss")
     plt.legend()
+    plt.title(f"{ticker} Training/Test Loss")
     plt.show()
 
-    # Step 7: Evaluate Model
-    model.eval()
+    # Prediction vs Actual
     with torch.no_grad():
-        predictions = model(X_test_tensor).squeeze()
-        plt.figure(figsize=(10, 6))
-        plt.plot(range(len(y_test)), y_test.values, label='Actual Prices')
-        plt.plot(range(len(predictions)), predictions.numpy(), label='Predicted Prices', alpha=0.7)
-        plt.title('Actual vs Predicted Prices')
-        plt.xlabel('Time')
-        plt.ylabel('Price')
-        plt.legend()
-        plt.show()
+        preds = model(X_test_tensor).squeeze().numpy()
+    plt.figure(figsize=(10, 6))
+    plt.plot(y_test.values, label='Actual')
+    plt.plot(preds, label='Predicted', alpha=0.7)
+    plt.title(f"{ticker} Stock Price Prediction")
+    plt.legend()
+    plt.show()
 
 
 if __name__ == '__main__':
